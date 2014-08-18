@@ -5,7 +5,6 @@
 package gomudnet
 
 import (
-	"bytes"
 	"container/list"
 	"errors"
 	"fmt"
@@ -22,21 +21,27 @@ const (
 	cl_state_closing    client_state = 2
 	cl_state_waiting_in client_state = 3
 	cl_state_ready_out  client_state = 4
-	cl_state_sleeping   client_state = 5
+	cl_state_ready_in   client_state = 5
+	cl_state_sleeping   client_state = 6
 	cl_state_waiting    client_state = 99
+	INPUT_BUFFER_SIZE   uint64       = 12 * 1024
+	OUTPUT_BUFFER_SIZE  uint64       = 24 * 1024
 )
 
 var (
 	ErrConnectionNilOrClosed = errors.New("read connection: closed or nil")
+	clientHandler            *client_handler
 )
 
 // Client represents a client connection.
 type Client struct {
-	conn      net.Conn
-	state     client_state
-	bufferIn  []byte
-	bufferOut []byte
-	pipeline  *Pipeline
+	conn          net.Conn
+	state         client_state
+	bufferIn      []byte
+	bufferOut     []byte
+	pipeline      *Pipeline
+	delimitterOut byte
+	delimitterIn  byte
 }
 
 // newClient creates a new Client and sets the Pipe of all the ChannelHandlers
@@ -45,8 +50,8 @@ func newClient(conn net.Conn, p *Pipeline) *Client {
 	cl := new(Client)
 	cl.conn = conn
 	cl.pipeline = p
-	cl.bufferIn = make([]byte, 12*1024)
-	cl.bufferOut = make([]byte, 24*1024)
+	cl.bufferIn = make([]byte, INPUT_BUFFER_SIZE)
+	cl.bufferOut = make([]byte, OUTPUT_BUFFER_SIZE)
 	cl.pipeline.owner = cl
 	cl.state = cl_state_connected
 
@@ -65,7 +70,7 @@ func newClient(conn net.Conn, p *Pipeline) *Client {
 func (cl *Client) Close() {
 	go func() {
 		if DEBUG {
-			log.Print("Closing signal received for %s", cl)
+			log.Printf("Closing signal received for %s", cl)
 		}
 
 		cl.state = cl_state_closing
@@ -83,17 +88,11 @@ func (cl *Client) String() string {
 
 // sendMessage sends the provided Message to the client connection and waits
 // for it to complete, then it informs the Pipeline that the Message was sent.
-func (cl *Client) sendMessage(msg Message) {
-	copy(cl.bufferOut, msg.Bytes())
-	cl.state = cl_state_ready_out
-
-	// wait until the state changes, (expectedly to cl_state_sleeping, but we
-	// only want to know that it's no longer cl_state_ready_out)
-	for cl.state == cl_state_ready_out {
-		time.Sleep(time.Millisecond * 100)
-	}
+func (cl *Client) sendMessage(msg Message, delimitter byte) {
+	cl.bufferOut = msg.Bytes()
+	cl.delimitterOut = delimitter
+	clientHandler.processOutput(cl)
 	cl.pipeline.messageSent(msg, cl)
-	cl.state = cl_state_waiting_in
 
 }
 
@@ -106,9 +105,9 @@ type client_handler struct {
 
 // newClientHandler creates a new client_handler.
 func newClientHandler() *client_handler {
-	cl := new(client_handler)
-	cl.clientList = list.New()
-	return cl
+	clientHandler = new(client_handler)
+	clientHandler.clientList = list.New()
+	return clientHandler
 }
 
 // newConnection creates a new Client with the given connection and the initial
@@ -127,7 +126,7 @@ func (ch *client_handler) dispatchClientHandler() (err error) {
 	}()
 
 	if DEBUG {
-		log.Println("Client handler started...")
+		log.Printf("Client handler started...")
 	}
 	ch.running = true
 	for ch.running {
@@ -140,14 +139,14 @@ func (ch *client_handler) dispatchClientHandler() (err error) {
 						log.Printf("New pipe opened: %s", cl.pipeline)
 					}
 
-					cl.pipeline.opened(cl)
-					cl.state = cl_state_waiting_in
+					go cl.pipeline.opened(cl)
+					cl.state = cl_state_ready_in
 				case cl_state_ready:
-					cl.pipeline.send(cl, cl.bufferIn, DIR_UPSTREAM)
-					cl.state = cl_state_waiting_in
+					go cl.pipeline.send(cl, cl.bufferIn, DIR_UPSTREAM)
+					cl.state = cl_state_ready_in
 				case cl_state_closing:
 					if DEBUG {
-						log.Println("Closing client :", cl.conn.RemoteAddr())
+						log.Printf("Closing client :", cl.conn.RemoteAddr())
 					}
 					cl.pipeline.closing(cl)
 					// this is forcibly closing the connection, although in
@@ -155,8 +154,8 @@ func (ch *client_handler) dispatchClientHandler() (err error) {
 					// to close
 					cl.conn.Close()
 					ch.clientList.Remove(e)
-					cl.pipeline.closed(cl)
-				case cl_state_waiting_in:
+					go cl.pipeline.closed(cl)
+				case cl_state_ready_in:
 					go ch.processInput(cl)
 				case cl_state_ready_out:
 					go ch.processOutput(cl)
@@ -166,11 +165,11 @@ func (ch *client_handler) dispatchClientHandler() (err error) {
 			}
 		}
 
-		time.Sleep(time.Millisecond)
+		time.Sleep(time.Millisecond * 10)
 	}
 
 	if DEBUG {
-		log.Println("Client handler stopped.")
+		log.Printf("Client handler stopped.")
 	}
 	return
 }
@@ -182,11 +181,12 @@ func (ch *client_handler) processInput(cl *Client) (err error) {
 		if DEBUG {
 			log.Printf("Waiting for input from %s.", cl)
 		}
-		if count, err := cl.conn.Read(cl.bufferIn); count > 0 {
-			cl.bufferIn = bytes.TrimSpace(cl.bufferIn)
+		buf := make([]byte, INPUT_BUFFER_SIZE)
+		if count, err := cl.conn.Read(buf); err == nil {
+			cl.bufferIn = buf[:count]
 
 			if DEBUG {
-				log.Printf("%s RCVD: %s", cl.conn.RemoteAddr(), cl.bufferIn)
+				log.Printf("%s RCVD: (%d)%v", cl.conn.RemoteAddr(), count, cl.bufferIn)
 			}
 			cl.state = cl_state_ready
 		} else {
@@ -208,18 +208,9 @@ func (ch *client_handler) processInput(cl *Client) (err error) {
 // processOutput writes to cl's output buffer to it's network file descriptor.
 func (ch *client_handler) processOutput(cl *Client) (err error) {
 	if cl.conn != nil {
-		if _, err = cl.conn.Write(cl.bufferOut); err == nil {
-
+		if count, err := cl.conn.Write(cl.bufferOut); err == nil {
 			if DEBUG {
-				log.Printf("%s SEND: %s", cl.conn.RemoteAddr(), cl.bufferOut)
-			}
-
-			//clear the buffers
-			for i := range cl.bufferOut {
-				cl.bufferOut[i] = 0
-			}
-			for i := range cl.bufferIn {
-				cl.bufferIn[i] = 0
+				log.Printf("%s SEND: (%d)%v", cl.conn.RemoteAddr(), count, cl.bufferOut)
 			}
 		} else {
 			if DEBUG {
@@ -233,9 +224,6 @@ func (ch *client_handler) processOutput(cl *Client) (err error) {
 	if err != nil {
 		log.Printf("ERROR: %s", err.Error())
 	}
-
-	// let's sleep and wait for the next event, probably an input
-	cl.state = cl_state_sleeping
 
 	return
 }

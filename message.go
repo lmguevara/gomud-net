@@ -77,7 +77,8 @@ func (m *message) Read(p []byte) (n int, err error) {
 }
 
 func (m *message) Write(p []byte) (n int, err error) {
-	return copy(m.buffer, p), nil
+	m.buffer = p
+	return len(p), nil
 }
 
 func (m *message) Source() interface{} {

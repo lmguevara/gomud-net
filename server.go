@@ -41,6 +41,42 @@ var (
 	currentServerState chan server_state
 )
 
+// ServerEventHandler provides functions that are called to handle specfic events
+// in Server's lifetime.
+type ServerEventHandler interface {
+	// StartingListener handles the event when Server is preparing to listen on
+	// host and port.
+	StartingListener(string, uint)
+
+	// StartedListener handles the event when Server has established the listener
+	// on host and port.
+	StartedListener(string, uint)
+
+	// ListenersStarted handles the event when all the Server's valid listeners
+	// have started.
+	//
+	// This event can also consider the Server to be running.
+	ListenersStarted()
+
+	// ClosingListener handles the event when the provided listener is preparing
+	// to close.
+	ClosingListener(net.Listener)
+
+	// ClosedListener handles the event when the provided listener is completely
+	// closed.
+	ClosedListener(net.Listener)
+
+	// ListenersClosed handles the event when all the Server's previously opened
+	// listeners are all closed.
+	ListenersClosed()
+
+	// StoppedCompletely handles the event when Server has completelt stopped.
+	StoppedCompletely()
+
+	// ErrorEncountered handles the event when Server encouters an error.
+	ErrorEncountered(error)
+}
+
 // The main server
 type Server struct {
 	ports           []uint
@@ -48,6 +84,7 @@ type Server struct {
 	listeners       []net.Listener
 	pipelineFactory *PipelineFactory
 	clientHandler   *client_handler
+	eventHandlers   []ServerEventHandler
 }
 
 // Creates a new Server with the given parameters.
@@ -56,6 +93,7 @@ func NewServer(ports []uint, hosts []string, pipelineFactory *PipelineFactory) *
 	s.ports = ports
 	s.hosts = hosts
 	s.pipelineFactory = pipelineFactory
+	s.eventHandlers = make([]ServerEventHandler, 0)
 	currentServerState = make(chan server_state)
 
 	return s
@@ -85,9 +123,12 @@ func (s *Server) Close() {
 	if DEBUG {
 		log.Printf("Server closed.")
 	}
+	for _, h := range s.eventHandlers {
+		h.StoppedCompletely()
+	}
 }
 
-// Start runs this Server with the current confirution.
+// Start runs this Server with the current configuration.
 //
 // This will bind to the hosts and ports combination provided by NewServer() and
 // start listening for connections. If blocking is true this will run the server
@@ -107,9 +148,13 @@ func (s *Server) Start(blocking bool) (err error) {
 		return ErrNilOrEmptyPipelineFactory
 	}
 	s.listeners = make([]net.Listener, len(s.hosts)*len(s.ports))
-	for h := range s.hosts {
-		for p := range s.ports {
-			go s.startListening(s.hosts[h], s.ports[p])
+	for _, h := range s.hosts {
+		for _, p := range s.ports {
+
+			for _, handler := range s.eventHandlers {
+				handler.StartingListener(h, p)
+			}
+			go s.startListening(h, p)
 		}
 	}
 
@@ -140,7 +185,7 @@ func (s *Server) Start(blocking bool) (err error) {
 	}
 
 	if DEBUG {
-		log.Println("Server started with no errors")
+		log.Printf("Server started with no errors")
 	}
 
 	if !blocking {
@@ -151,6 +196,22 @@ func (s *Server) Start(blocking bool) (err error) {
 		s.wait()
 	}
 	return err
+}
+
+func (s *Server) AddEventHandler(h ServerEventHandler) {
+	s.eventHandlers = append(s.eventHandlers, h)
+}
+
+func (s *Server) RemoveEventHandler(h ServerEventHandler) {
+	i := 0
+	for ; i < len(s.eventHandlers); i++ {
+		if s.eventHandlers[i] == h {
+			break
+		}
+	}
+	temp := s.listeners[:i-1]
+	temp = append(temp, s.listeners[i+1:]...)
+	s.listeners = temp
 }
 
 // wait is the main server loop
@@ -165,8 +226,12 @@ func (s *Server) wait() {
 				s.clientHandler.running = false
 			} else if state == state_cl_handler_stopped {
 				//close listeners
-				for i := range s.listeners {
-					s.listeners[i].Close()
+				for _, ln := range s.listeners {
+
+					for _, h := range s.eventHandlers {
+						h.ClosingListener(ln)
+					}
+					ln.Close()
 				}
 			} else if state >= state_listeners_stopped {
 				running = false
@@ -178,7 +243,7 @@ func (s *Server) wait() {
 		time.Sleep(time.Millisecond)
 	}
 	if DEBUG {
-		log.Println("Server stopped.")
+		log.Printf("Server stopped.")
 	}
 	currentServerState <- state_server_stopped
 
@@ -191,6 +256,10 @@ func (s *Server) startListening(host string, port uint) (err error) {
 	if err == nil {
 		if DEBUG {
 			log.Printf("Listening on %s", ln.Addr())
+		}
+
+		for _, h := range s.eventHandlers {
+			h.StartedListener(host, port)
 		}
 
 		ctr := 0
@@ -207,7 +276,11 @@ func (s *Server) startListening(host string, port uint) (err error) {
 			// inform Start() about it
 			currentServerState <- state_listeners_started
 			if DEBUG {
-				log.Println("Listeners started.")
+				log.Printf("Listeners started.")
+			}
+
+			for _, h := range s.eventHandlers {
+				h.ListenersStarted()
 			}
 		}
 
@@ -215,11 +288,15 @@ func (s *Server) startListening(host string, port uint) (err error) {
 			defer func() {
 				//everything should be close now
 				if DEBUG {
-					log.Println("All Listeners closed.")
+					log.Printf("All Listeners closed.")
 				}
 				// wait() will be waiting for this signal after issuin Close()
 				// to all listeners
 				currentServerState <- state_listeners_stopped
+
+				for _, h := range s.eventHandlers {
+					h.ListenersClosed()
+				}
 			}()
 		}
 
@@ -252,11 +329,22 @@ func (s *Server) startListening(host string, port uint) (err error) {
 				default:
 				}
 			} else {
+				for _, h := range s.eventHandlers {
+					h.ErrorEncountered(err)
+				}
 				running = false
 			}
 		}
 		if DEBUG {
-			log.Println(ln.Addr(), "closed.")
+			log.Printf("%s close.", ln.Addr())
+		}
+
+		for _, h := range s.eventHandlers {
+			h.ClosedListener(ln)
+		}
+	} else {
+		for _, h := range s.eventHandlers {
+			h.ErrorEncountered(err)
 		}
 	}
 

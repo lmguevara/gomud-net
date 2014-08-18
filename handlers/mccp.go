@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"gomudnet"
 	"gomudnet/handlers/zlib"
-	"time"
 )
 
 const (
@@ -46,10 +45,6 @@ func (mccp *MCCPHandler) Receive(msg gomudnet.Message, from gomudnet.StreamDirec
 
 		mccpStartMessage = gomudnet.NewMessage(mccp, msg.Source(), []byte{telnet_code_IAC, telnet_code_SB, telenet_code_MCCP, telnet_code_IAC, telnet_code_SE})
 		mccp.pipeline.SendDownstream(mccp, mccpStartMessage)
-
-		// I still don't know why this is needed, but without this the client
-		// would suddenly close after sending the MCCP start code.
-		time.Sleep(time.Second / 10) // give some time for the client to setup
 		newMsg = nil
 	}
 
@@ -58,7 +53,7 @@ func (mccp *MCCPHandler) Receive(msg gomudnet.Message, from gomudnet.StreamDirec
 
 func (mccp *MCCPHandler) Sent(message gomudnet.Message, cl *gomudnet.Client) error {
 	if mccpStartMessage != nil && mccpStartMessage == message {
-		mccp.pipeline.AddLast("zlib", zlib.NewZlibChannelHandler())
+		mccp.pipeline.AddFirst("zlib", zlib.NewZlibChannelHandler())
 		mccp.Pipeline().Unlock(mccp)
 	}
 	return nil

@@ -5,9 +5,9 @@
 package handlers
 
 import (
-	"bytes"
 	"fmt"
 	"gomudnet"
+	"log"
 )
 
 // EchoChannelHandler is an implementation of ChannelHandler which echoes the
@@ -26,7 +26,11 @@ func NewEchoChannelHandler() gomudnet.ChannelHandler {
 func (dch *EchoChannelHandler) Receive(msg gomudnet.Message, from gomudnet.StreamDirection) (newMsg gomudnet.Message) {
 	str := msg.String() + "\n"
 	newMsg = gomudnet.NewMessage(dch, msg.Source(), []byte(str))
-	return
+
+	if gomudnet.DEBUG {
+		log.Printf("ECHO: %s", newMsg)
+	}
+	return newMsg
 }
 
 func (dch *EchoChannelHandler) Sent(message gomudnet.Message, cl *gomudnet.Client) error {
@@ -42,9 +46,7 @@ func (dch *EchoChannelHandler) SetPipeline(pipeline *gomudnet.Pipeline) {
 }
 
 func (dch *EchoChannelHandler) Opened(cl *gomudnet.Client) error {
-	strBuf := new(bytes.Buffer)
-	strBuf.WriteString("Welcome!")
-	dch.pipeline.SendDownstream(dch, gomudnet.NewMessage(dch, cl, strBuf.Bytes()))
+	dch.pipeline.SendDownstream(dch, gomudnet.NewMessage(dch, cl, []byte("Welcome!")))
 	return nil
 }
 

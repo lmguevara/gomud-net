@@ -263,6 +263,7 @@ func (p *Pipeline) deliverMessage(sender interface{}, msg Message, direction Str
 
 	if DEBUG {
 		log.Printf("sender: %s, msg: %s, dir: %d", sender, msg.ToString(), direction)
+		log.Printf("Pipe: %s", p)
 	}
 	//sender is a ChannelHandler, find the receiver based on the direction
 	if source, ok := sender.(ChannelHandler); ok {
@@ -317,14 +318,19 @@ func (p *Pipeline) deliverMessage(sender interface{}, msg Message, direction Str
 		// it could only mean send the byte slice to the Client.
 		if direction == DIR_DOWNSTREAM {
 			if cl, ok := msg.Destination().(*Client); ok {
-				go cl.sendMessage(msg)
+				if chSender, ok := sender.(ChannelHandler); ok {
+					if DEBUG {
+						log.Printf("%s SENDING  TO CLIENT: (%d)%v", chSender, len(msg.Bytes()), msg.Bytes())
+					}
+					cl.sendMessage(msg, chSender.MessageDelimitter())
+				}
 			} else if _, ok = msg.Destination().(ChannelHandler); ok {
 				p.deliverMessage(sender, msg, direction)
 			}
 		}
 	} else {
 		if p.lockedBy == nil || p.lockedBy == receiver {
-			p.delimitMessage(msg, receiver.MessageDelimitter())
+			//p.delimitMessage(msg, receiver.MessageDelimitter())
 			nMsg := receiver.Receive(msg, direction)
 
 			if nMsg != nil {
@@ -339,7 +345,7 @@ func (p *Pipeline) deliverMessage(sender interface{}, msg Message, direction Str
 					} else {
 						newDir = DIR_UPSTREAM
 					}
-					p.deliverMessage(sender, nMsg, newDir)
+					p.deliverMessage(receiver, nMsg, newDir)
 				}
 			} else {
 				log.Printf("WARN: Message returned by %s is nil", receiver)
@@ -448,13 +454,7 @@ func (p *Pipeline) send(cl *Client, b []byte, from StreamDirection) {
 
 // Delimit the msg's raw data using the given delimitter.
 func (p *Pipeline) delimitMessage(msg Message, delimitter byte) {
-	if delimitter > 0 {
-		b := msg.Bytes()
-		for i := range b {
-			if b[i] == delimitter {
-				b[i] = 0
-				break
-			}
-		}
-	}
+	b := msg.Bytes()
+	tmp := bytes.Split(b, []byte{delimitter})
+	msg.Write(tmp[0])
 }

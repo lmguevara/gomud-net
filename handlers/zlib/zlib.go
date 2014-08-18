@@ -7,31 +7,31 @@
 package zlib
 
 import (
+	"bytes"
 	"compress/zlib"
+	"fmt"
 	"gomudnet"
 )
 
 type ZlibChannel struct {
-	pipe *gomudnet.Pipeline
+	pipe   *gomudnet.Pipeline
+	out    *zlib.Writer
+	buffer *bytes.Buffer
 }
 
 func NewZlibChannelHandler() *ZlibChannel {
 	zChan := new(ZlibChannel)
+	zChan.buffer = new(bytes.Buffer)
+	zChan.out, _ = zlib.NewWriterLevel(zChan.buffer, zlib.BestCompression)
 
 	return zChan
 }
 
 func (this *ZlibChannel) Receive(msg gomudnet.Message, from gomudnet.StreamDirection) gomudnet.Message {
 	if from == gomudnet.DIR_DOWNSTREAM {
-		compressor := zlib.NewWriter(msg)
-		defer compressor.Close()
-		if _, err := compressor.Write(msg.Bytes()); err == nil {
-			compressor.Flush()
-		}
-	} else if from == gomudnet.DIR_UPSTREAM {
-		if dc, err := zlib.NewReader(msg); err == nil {
-			defer dc.Close()
-			dc.Read(msg.Bytes())
+		if _, err := this.out.Write(msg.Bytes()); err == nil {
+			this.out.Flush()
+			this.buffer.WriteTo(msg)
 		}
 	}
 
@@ -64,4 +64,8 @@ func (this *ZlibChannel) MessageDelimitter() byte {
 
 func (this *ZlibChannel) Sent(msg gomudnet.Message, cl *gomudnet.Client) error {
 	return nil
+}
+
+func (this *ZlibChannel) String() string {
+	return fmt.Sprintf("ZLIBChannel@%v", &this)
 }
